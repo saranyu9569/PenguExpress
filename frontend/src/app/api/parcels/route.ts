@@ -1,87 +1,189 @@
 import { NextRequest, NextResponse } from 'next/server';
-import mysql, { RowDataPacket } from 'mysql2/promise';
+import mysql from 'mysql2/promise';
+import twilio from 'twilio';
 
-const dbConfig = {
+const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_DATABASE,
-};
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
 
-async function assignLockers(connection: mysql.Connection) {
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+interface Locker {
+  locker_ID: number;
+  status: 'Available' | 'Unavailable';
+}
+
+function generateParcelID() {
+  const randomNumbers = Math.floor(Math.random() * 100000000000).toString().padStart(11, '0');
+  return `AC${randomNumbers}`;
+}
+
+function generatePassword() {
+  return Math.floor(1000 + Math.random() * 9000).toString();
+}
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const action = searchParams.get('action');
+
+  if (action === 'availableCouriers') {
+    try {
+      const connection = await pool.getConnection();
+      try {
+        const [rows] = await connection.query(
+          'SELECT courier_ID, courier_name FROM couriers WHERE status = "Available"'
+        );
+        return NextResponse.json(rows);
+      } finally {
+        connection.release();
+      }
+    } catch (error) {
+      console.error('Error fetching available couriers:', error);
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+    }
+  } else {
+    try {
+      const connection = await pool.getConnection();
+      try {
+        const [rows] = await connection.query('SELECT * FROM parcels');
+        return NextResponse.json(rows);
+      } finally {
+        connection.release();
+      }
+    } catch (error) {
+      console.error('Error fetching parcels:', error);
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+    }
+  }
+}
+
+export async function POST(request: NextRequest) {
   try {
-    // Fetch all parcels with status "Waiting"
-    const [waitingRows]: [RowDataPacket[], any] = await connection.execute(
-      'SELECT * FROM parcel WHERE status = "Waiting"'
-    );
+    const { sender_tel, receiver_tel, courier_ID, status } = await request.json();
+    const parcel_ID = generateParcelID();
+    const courierTel = '+66882856552'; // Default courier telephone number
+    const parcelPassword = generatePassword(); // Generate 4-digit password
 
-    // Fetch parcels that are not delivered
-    const [rows]: [RowDataPacket[], any] = await connection.execute(
-      'SELECT * FROM parcel WHERE status != "Delivered"'
-    );
+    const connection = await pool.getConnection();
 
-    // Determine available lockers
-    const usedLockers = new Set(rows.map((parcel: any) => parcel.lockerNumber));
-    const allLockers = new Set(['001', '002']);
-    const availableLockers = Array.from(allLockers).filter(locker => !usedLockers.has(locker));
+    try {
+      await connection.beginTransaction();
 
-    // Assign waiting parcels to available lockers if any
-    if (availableLockers.length > 0 && waitingRows.length > 0) {
-      for (const parcel of waitingRows) {
-        const [firstWaiting] = waitingRows;
+      let locker_ID = null;
+      if (status === 'In Locker') {
+        const [availableLockers] = await connection.query<mysql.RowDataPacket[]>(
+          'SELECT locker_ID FROM lockers WHERE status = "Available" LIMIT 1'
+        );
+
         if (availableLockers.length > 0) {
-          const lockerToAssign = availableLockers.shift(); // Get an available locker
-          await connection.execute(
-            'UPDATE parcel SET status = "Processing", lockerNumber = ? WHERE parcel_ID = ?',
-            [lockerToAssign, firstWaiting.parcel_ID]
+          locker_ID = (availableLockers[0] as Locker).locker_ID;
+          await connection.query(
+            'UPDATE lockers SET status = "Unavailable" WHERE locker_ID = ?',
+            [locker_ID]
           );
+        } else {
+          throw new Error('No available lockers');
         }
       }
+
+      await connection.query(
+        'INSERT INTO parcels (parcel_ID, sender_tel, receiver_tel, courier_ID, status, locker_ID, parcel_password) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [parcel_ID, sender_tel, receiver_tel, courier_ID, status, locker_ID, parcelPassword]
+      );
+
+      // Set the selected courier's status to "Busy"
+      await connection.query(
+        'UPDATE couriers SET status = "Busy" WHERE courier_ID = ?',
+        [courier_ID]
+      );
+
+      await connection.commit();
+
+      // Send SMS using Twilio
+      await twilioClient.messages.create({
+        body: `A new parcel ${parcel_ID} has been assigned to you. Your verification code is: ${parcelPassword}`,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: courierTel
+      });
+
+      return NextResponse.json({ parcel_ID, message: 'Parcel created successfully', locker_ID }, { status: 201 });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
     }
   } catch (error) {
-    console.error('Failed to assign lockers:', error);
-    throw new Error('Failed to assign lockers');
+    console.error('Error creating parcel:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
-export async function GET(req: NextRequest) {
+export async function PUT(request: NextRequest) {
   try {
-    const connection = await mysql.createConnection(dbConfig);
+    const { parcel_ID, status } = await request.json();
+    const connection = await pool.getConnection();
 
-    const [rows]: [RowDataPacket[], any] = await connection.execute(
-      'SELECT * FROM parcel WHERE status != "Delivered"'
-    );
+    try {
+      await connection.beginTransaction();
 
-    await assignLockers(connection); 
+      if (status === 'In Locker') {
+        const [availableLockers] = await connection.query<mysql.RowDataPacket[]>(
+          'SELECT locker_ID FROM lockers WHERE status = "Available" LIMIT 1'
+        );
 
-    return NextResponse.json(rows);
-  } catch (error) {
-    console.error(error);
-    return NextResponse.json({ message: 'Internal server error' }, { status: 500 });
-  }
-}
+        if (availableLockers.length > 0) {
+          const locker_ID = (availableLockers[0] as Locker).locker_ID;
+          await connection.query(
+            'UPDATE lockers SET status = "Unavailable" WHERE locker_ID = ?',
+            [locker_ID]
+          );
+          await connection.query(
+            'UPDATE parcels SET status = ?, locker_ID = ? WHERE parcel_ID = ?',
+            [status, locker_ID, parcel_ID]
+          );
+        } else {
+          throw new Error('No available lockers');
+        }
+      } else if (status === 'Delivered') {
+        await connection.query(
+          'UPDATE lockers SET status = "Available" WHERE locker_ID = (SELECT locker_ID FROM parcels WHERE parcel_ID = ?)',
+          [parcel_ID]
+        );
+        await connection.query(
+          'UPDATE parcels SET status = ?, locker_ID = NULL WHERE parcel_ID = ?',
+          [status, parcel_ID]
+        );
 
-export async function POST(req: NextRequest) {
-  try {
-    const { weight, type, shipping_cost, parcel_sender, parcel_reciever, parcel_courier } = await req.json();
+        // Set the courier's status back to "Available"
+        await connection.query(
+          'UPDATE couriers SET status = "Available" WHERE courier_ID = (SELECT courier_ID FROM parcels WHERE parcel_ID = ?)',
+          [parcel_ID]
+        );
+      } else {
+        // For 'Processing' status or any other status
+        await connection.query(
+          'UPDATE parcels SET status = ? WHERE parcel_ID = ?',
+          [status, parcel_ID]
+        );
+      }
 
-    if (!weight || !type || !shipping_cost || !parcel_sender || !parcel_reciever || !parcel_courier) {
-      return NextResponse.json({ message: 'All fields are required' }, { status: 400 });
+      await connection.commit();
+      return NextResponse.json({ message: 'Parcel status updated successfully' });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
     }
-
-    const parcel_ID = `PARCEL-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const status = 'Processing'; // Default status
-
-    const connection = await mysql.createConnection(dbConfig);
-
-    await connection.execute(
-      'INSERT INTO parcel (parcel_ID,parcel_sender, parcel_reciever, parcel_courier, status) VALUES (?, ?, ?, ?, ?)',
-      [parcel_ID, parcel_sender, parcel_reciever, parcel_courier, status]
-    );
-
-    return NextResponse.json({ message: 'Parcel created successfully' });
   } catch (error) {
-    console.error(error);
-    return NextResponse.json({ message: 'Internal server error' }, { status: 500 });
+    console.error('Error updating parcel status:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

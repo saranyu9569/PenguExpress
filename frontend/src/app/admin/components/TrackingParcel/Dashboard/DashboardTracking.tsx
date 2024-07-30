@@ -4,54 +4,59 @@ import React, { useEffect, useState } from "react";
 
 interface Parcel {
   parcel_ID: string;
-  parcel_sender: string;
-  parcel_reciever: string;
-  parcel_courier: string;
-  status: "Processing" | "In Locker" | "Delivered" | "Waiting";
-  lockerNumber?: string;
+  sender_tel: string;
+  receiver_tel: string;
+  courier_ID: string;
+  status: "Processing" | "In Locker" | "Delivered";
+  locker_ID: number | null;
 }
 
-interface ParcelListProps {
-  updateParcelStatus: (
-    id: string,
-    newStatus: Parcel["status"]
-  ) => Promise<void>;
-}
-
-const ParcelList: React.FC<ParcelListProps> = ({ updateParcelStatus }) => {
+const DashboardTracking: React.FC = () => {
   const [parcels, setParcels] = useState<Parcel[]>([]);
 
   useEffect(() => {
-    const fetchParcels = async () => {
-      try {
-        const response = await fetch("/api/parcels");
-        if (response.ok) {
-          const data = await response.json();
-          setParcels(
-            data.filter((parcel: Parcel) => parcel.status !== "Delivered")
-          );
-        } else {
-          console.error("Failed to fetch parcels");
-        }
-      } catch (error) {
-        console.error("Failed to fetch parcels:", error);
-      }
-    };
-
     fetchParcels();
   }, []);
 
-  const handleStatusChange = async (
-    id: string,
-    newStatus: Parcel["status"]
-  ) => {
-    await updateParcelStatus(id, newStatus);
-    const response = await fetch("/api/parcels");
-    if (response.ok) {
-      const updatedParcels = await response.json();
-      setParcels(
-        updatedParcels.filter((parcel: Parcel) => parcel.status !== "Delivered")
-      );
+  const fetchParcels = async () => {
+    try {
+      const response = await fetch("/api/parcels");
+      if (response.ok) {
+        const data: Parcel[] = await response.json();
+        setParcels(data);
+      } else {
+        console.error("Failed to fetch parcels");
+      }
+    } catch (error) {
+      console.error("Failed to fetch parcels:", error);
+    }
+  };
+
+  const handleStatusChange = async (id: string, newStatus: Parcel["status"]) => {
+    if (newStatus === "Delivered") {
+      const confirmed = window.confirm("Are you sure you want to mark this parcel as delivered? An SMS will be sent to the courier.");
+      if (!confirmed) return;
+    }
+
+    try {
+      const response = await fetch('/api/parcels', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ parcel_ID: id, status: newStatus }),
+      });
+
+      if (response.ok) {
+        await fetchParcels();
+        if (newStatus === "Delivered") {
+          alert("Parcel marked as delivered. An SMS has been sent to the courier with a verification code.");
+        }
+      } else {
+        console.error("Failed to update parcel status");
+      }
+    } catch (error) {
+      console.error("Failed to update parcel status:", error);
     }
   };
 
@@ -63,11 +68,11 @@ const ParcelList: React.FC<ParcelListProps> = ({ updateParcelStatus }) => {
           <thead>
             <tr className="bg-gray-200">
               <th className="p-2 text-left">Parcel ID</th>
-              <th className="p-2 text-left">Sender</th>
-              <th className="p-2 text-left">Receiver</th>
-              <th className="p-2 text-left">Courier</th>
+              <th className="p-2 text-left">Sender Tel</th>
+              <th className="p-2 text-left">Receiver Tel</th>
+              <th className="p-2 text-left">Courier ID</th>
               <th className="p-2 text-left">Status</th>
-              <th className="p-2 text-left">Locker</th>
+              <th className="p-2 text-left">Locker ID</th>
               <th className="p-2 text-left">Actions</th>
             </tr>
           </thead>
@@ -75,11 +80,11 @@ const ParcelList: React.FC<ParcelListProps> = ({ updateParcelStatus }) => {
             {parcels.map((parcel) => (
               <tr key={parcel.parcel_ID} className="border-b">
                 <td className="p-2">{parcel.parcel_ID}</td>
-                <td className="p-2">{parcel.parcel_sender}</td>
-                <td className="p-2">{parcel.parcel_reciever}</td>
-                <td className="p-2">{parcel.parcel_courier}</td>
+                <td className="p-2">{parcel.sender_tel}</td>
+                <td className="p-2">{parcel.receiver_tel}</td>
+                <td className="p-2">{parcel.courier_ID}</td>
                 <td className="p-2">{parcel.status}</td>
-                <td className="p-2">{parcel.lockerNumber || "N/A"}</td>
+                <td className="p-2">{parcel.locker_ID || "N/A"}</td>
                 <td className="p-2">
                   <select
                     value={parcel.status}
@@ -105,4 +110,4 @@ const ParcelList: React.FC<ParcelListProps> = ({ updateParcelStatus }) => {
   );
 };
 
-export default ParcelList;
+export default DashboardTracking;
